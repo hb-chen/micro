@@ -1,46 +1,42 @@
+// Package config contains helper methods for
+// client side config management (`~/.micro/config.json` file).
+// It uses the `JSONValues` helper
 package config
 
 import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/juju/fslock"
 	conf "github.com/micro/go-micro/v3/config"
-	fs "github.com/micro/go-micro/v3/config/source/file"
+	"github.com/micro/micro/v3/internal/user"
 )
 
 var (
-	baseDir = ".micro"
 
 	// lock in single process
 	mtx sync.Mutex
 
-	// file for global micro config
-	file = filepath.Join(baseDir, "config.json")
-
-	// full path to file
-	path, _ = filePath()
+	// File is the filepath to the config file that
+	// contains all user configuration
+	File = filepath.Join(user.Dir, "config.json")
 
 	// a global lock for the config
-	lock = fslock.New(path)
+	lock = fslock.New(File)
 )
 
 // SetConfig sets the config file
-func SetConfig(f string) {
+func SetConfig(configFilePath string) {
 	mtx.Lock()
 	defer mtx.Unlock()
 
-	// path is the full path
-	path = f
-	// the name of the file
-	file = filepath.Base(f)
+	File = configFilePath
 	// new lock for the file
-	lock = fslock.New(path)
+	lock = fslock.New(File)
 }
 
 // config is a singleton which is required to ensure
@@ -48,7 +44,7 @@ func SetConfig(f string) {
 // from disk
 
 // Get a value from the .micro file
-func Get(path ...string) (string, error) {
+func Get(path string) (string, error) {
 	mtx.Lock()
 	defer mtx.Unlock()
 
@@ -56,7 +52,6 @@ func Get(path ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer config.Close()
 
 	// acquire lock
 	if err := lock.Lock(); err != nil {
@@ -64,7 +59,7 @@ func Get(path ...string) (string, error) {
 	}
 	defer lock.Unlock()
 
-	val := config.Get(path...)
+	val := config.Get(path)
 	v := strings.TrimSpace(val.String(""))
 	if len(v) > 0 {
 		return v, nil
@@ -75,7 +70,7 @@ func Get(path ...string) (string, error) {
 	v = strings.TrimSpace(v)
 
 	// don't return nil decoded value
-	if v == "null" {
+	if strings.TrimSpace(v) == "null" {
 		return "", nil
 	}
 
@@ -83,7 +78,7 @@ func Get(path ...string) (string, error) {
 }
 
 // Set a value in the .micro file
-func Set(value string, p ...string) error {
+func Set(path, value string) error {
 	mtx.Lock()
 	defer mtx.Unlock()
 
@@ -91,7 +86,6 @@ func Set(value string, p ...string) error {
 	if err != nil {
 		return err
 	}
-	defer config.Close()
 	// acquire lock
 	if err := lock.Lock(); err != nil {
 		return err
@@ -99,18 +93,10 @@ func Set(value string, p ...string) error {
 	defer lock.Unlock()
 
 	// set the value
-	config.Set(value, p...)
+	config.Set(path, value)
 
 	// write to the file
-	return ioutil.WriteFile(path, config.Bytes(), 0644)
-}
-
-func filePath() (string, error) {
-	usr, err := user.Current()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(usr.HomeDir, file), nil
+	return ioutil.WriteFile(File, config.Bytes(), 0644)
 }
 
 func moveConfig(from, to string) error {
@@ -132,9 +118,9 @@ func moveConfig(from, to string) error {
 }
 
 // newConfig returns a loaded config
-func newConfig() (conf.Config, error) {
+func newConfig() (*conf.JSONValues, error) {
 	// check if the directory exists, otherwise create it
-	dir := filepath.Dir(path)
+	dir := filepath.Dir(File)
 
 	// for legacy purposes check if .micro is a file or directory
 	if f, err := os.Stat(dir); err != nil {
@@ -149,36 +135,30 @@ func newConfig() (conf.Config, error) {
 	} else {
 		// if not a directory, copy and move the config
 		if !f.IsDir() {
-			if err := moveConfig(dir, path); err != nil {
-				return nil, fmt.Errorf("Failed to move config from %s to %s: %v", dir, path, err)
+			if err := moveConfig(dir, File); err != nil {
+				return nil, fmt.Errorf("Failed to move config from %s to %s: %v", dir, File, err)
 			}
 		}
 	}
 
 	// now write the file if it does not exist
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		ioutil.WriteFile(path, []byte(`{}`), 0644)
+	if _, err := os.Stat(File); os.IsNotExist(err) {
+		ioutil.WriteFile(File, []byte(`{"env":"local"}`), 0644)
 	} else if err != nil {
-		return nil, fmt.Errorf("Failed to write config file %s: %v", path, err)
+		return nil, fmt.Errorf("Failed to write config file %s: %v", File, err)
 	}
 
-	// create a new config
-	c, err := conf.NewConfig(
-		conf.WithSource(
-			fs.NewSource(
-				fs.WithPath(path),
-			),
-		),
-	)
+	contents, err := ioutil.ReadFile(File)
 	if err != nil {
 		return nil, err
 	}
 
-	// load the config
-	if err := c.Load(); err != nil {
-		return nil, err
-	}
+	c := conf.NewJSONValues(contents)
 
 	// return the conf
 	return c, nil
+}
+
+func Path(paths ...string) string {
+	return strings.Join(paths, ".")
 }

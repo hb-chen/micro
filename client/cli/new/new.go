@@ -12,10 +12,10 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/micro/cli/v2"
 	"github.com/micro/micro/v3/cmd"
 	tmpl "github.com/micro/micro/v3/internal/template"
 	"github.com/micro/micro/v3/internal/usage"
+	"github.com/urfave/cli/v2"
 	"github.com/xlab/treeprint"
 )
 
@@ -190,6 +190,7 @@ func Run(ctx *cli.Context) error {
 		GoPath:    goPath,
 		UseGoPath: false,
 		Files: []file{
+			{"service.mu", tmpl.Service},
 			{"main.go", tmpl.MainSRV},
 			{"generate.go", tmpl.GenerateFile},
 			{"handler/" + dir + ".go", tmpl.HandlerSRV},

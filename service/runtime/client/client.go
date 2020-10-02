@@ -6,9 +6,9 @@ import (
 
 	goclient "github.com/micro/go-micro/v3/client"
 	"github.com/micro/go-micro/v3/runtime"
+	pb "github.com/micro/micro/v3/proto/runtime"
 	"github.com/micro/micro/v3/service/client"
 	"github.com/micro/micro/v3/service/context"
-	pb "github.com/micro/micro/v3/service/runtime/proto"
 )
 
 type svc struct {
@@ -52,13 +52,14 @@ func (s *svc) Create(svc *runtime.Service, opts ...runtime.CreateOption) error {
 			Metadata: svc.Metadata,
 		},
 		Options: &pb.CreateOptions{
-			Command:   options.Command,
-			Args:      options.Args,
-			Env:       options.Env,
-			Type:      options.Type,
-			Image:     options.Image,
-			Namespace: options.Namespace,
-			Secrets:   options.Secrets,
+			Command:    options.Command,
+			Args:       options.Args,
+			Env:        options.Env,
+			Type:       options.Type,
+			Image:      options.Image,
+			Namespace:  options.Namespace,
+			Secrets:    options.Secrets,
+			Entrypoint: options.Entrypoint,
 		},
 	}
 
@@ -190,6 +191,7 @@ func (s *svc) Read(opts ...runtime.ReadOption) ([]*runtime.Service, error) {
 			Version:  service.Version,
 			Source:   service.Source,
 			Metadata: service.Metadata,
+			Status:   runtime.ServiceStatus(service.Status),
 		}
 		services = append(services, svc)
 	}
@@ -212,7 +214,8 @@ func (s *svc) Update(svc *runtime.Service, opts ...runtime.UpdateOption) error {
 			Metadata: svc.Metadata,
 		},
 		Options: &pb.UpdateOptions{
-			Namespace: options.Namespace,
+			Namespace:  options.Namespace,
+			Entrypoint: options.Entrypoint,
 		},
 	}
 
@@ -230,7 +233,7 @@ func (s *svc) Delete(svc *runtime.Service, opts ...runtime.DeleteOption) error {
 		o(&options)
 	}
 
-	// runtime service create request
+	// runtime service dekete request
 	req := &pb.DeleteRequest{
 		Service: &pb.Service{
 			Name:     svc.Name,
