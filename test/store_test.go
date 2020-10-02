@@ -31,8 +31,8 @@ func testStore(t *T) {
 		if err == nil {
 			return outp, errors.New("store read should fail")
 		}
-		if !strings.Contains(string(outp), "not found") {
-			return outp, fmt.Errorf("Output should be 'not found', got %v", string(outp))
+		if !strings.Contains(string(outp), "Not found") {
+			return outp, fmt.Errorf("Output should be 'Not found', got %v", string(outp))
 		}
 		return outp, nil
 	}, 8*time.Second); err != nil {
@@ -74,8 +74,8 @@ func testStore(t *T) {
 		t.Fatalf("store read should fail: %v", string(outp))
 		return
 	}
-	if !strings.Contains(string(outp), "not found") {
-		t.Fatalf("Expected 'not found\n', got: '%v'", string(outp))
+	if !strings.Contains(string(outp), "Not found") {
+		t.Fatalf("Expected 'Not found\n', got: '%v'", string(outp))
 		return
 	}
 
@@ -106,8 +106,8 @@ func testStore(t *T) {
 		t.Fatalf("store read should fail: %v", string(outp))
 		return
 	}
-	if !strings.Contains(string(outp), "not found") {
-		t.Fatalf("Expected 'not found\n', got: '%v'", string(outp))
+	if !strings.Contains(string(outp), "Not found") {
+		t.Fatalf("Expected 'Not found\n', got: '%v'", string(outp))
 		return
 	}
 
@@ -145,7 +145,7 @@ func testStore(t *T) {
 }
 
 func TestStoreImpl(t *testing.T) {
-	TrySuite(t, testStoreImpl, 5)
+	TrySuite(t, testStoreImpl, 3)
 }
 
 func testStoreImpl(t *T) {
@@ -157,7 +157,7 @@ func testStoreImpl(t *T) {
 	}
 
 	cmd := serv.Command()
-	outp, err := cmd.Exec("run", "./service/storeexample")
+	outp, err := cmd.Exec("run", "--image", "localhost:5000/cells:v3", "./service/storeexample")
 	if err != nil {
 		t.Fatalf("micro run failure, output: %v", string(outp))
 		return
@@ -175,7 +175,7 @@ func testStoreImpl(t *T) {
 			return outp, errors.New("Can't find example service in runtime")
 		}
 		return outp, err
-	}, 15*time.Second); err != nil {
+	}, 90*time.Second); err != nil {
 		return
 	}
 
@@ -209,5 +209,51 @@ func testStoreImpl(t *T) {
 	if err != nil {
 		t.Fatalf("Error %s, %s", err, outp)
 	}
+}
 
+func TestBlobStore(t *testing.T) {
+	TrySuite(t, testBlobStore, retryCount)
+}
+
+func testBlobStore(t *T) {
+	t.Parallel()
+	serv := NewServer(t, WithLogin())
+	defer serv.Close()
+	if err := serv.Run(); err != nil {
+		return
+	}
+
+	cmd := serv.Command()
+	outp, err := cmd.Exec("run", "--image", "localhost:5000/cells:v3", "./service/blob-store")
+	if err != nil {
+		t.Fatalf("micro run failure, output: %v", string(outp))
+		return
+	}
+
+	if err := Try("Find blob-store", t, func() ([]byte, error) {
+		outp, err := cmd.Exec("status")
+		if err != nil {
+			return outp, err
+		}
+
+		if !statusRunning("blob-store", "latest", outp) {
+			return outp, errors.New("Can't find blob-store service in runtime")
+		}
+		return outp, err
+	}, 15*time.Second); err != nil {
+		return
+	}
+
+	if err := Try("Check logs", t, func() ([]byte, error) {
+		outp, err := cmd.Exec("logs", "blob-store")
+		if err != nil {
+			return nil, err
+		}
+		if !strings.Contains(string(outp), "Read from blob store: world") {
+			return outp, fmt.Errorf("Didn't read from the blob store")
+		}
+		return nil, nil
+	}, 60*time.Second); err != nil {
+		return
+	}
 }

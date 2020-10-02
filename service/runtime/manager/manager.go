@@ -4,24 +4,17 @@ import (
 	"time"
 
 	gorun "github.com/micro/go-micro/v3/runtime"
-	"github.com/micro/go-micro/v3/store"
-	cachest "github.com/micro/go-micro/v3/store/cache"
-	filest "github.com/micro/go-micro/v3/store/file"
-	"github.com/micro/go-micro/v3/store/memory"
 	"github.com/micro/micro/v3/internal/namespace"
 	"github.com/micro/micro/v3/service/logger"
 	"github.com/micro/micro/v3/service/runtime"
+	"github.com/micro/micro/v3/service/runtime/builder"
+	"github.com/micro/micro/v3/service/runtime/manager/util"
 )
 
-// Init initializes the runtime
-func (m *manager) Init(...gorun.Option) error {
-	return nil
-}
-
 // Create registers a service
-func (m *manager) Create(srv *gorun.Service, opts ...gorun.CreateOption) error {
+func (m *manager) Create(srv *runtime.Service, opts ...runtime.CreateOption) error {
 	// parse the options
-	var options gorun.CreateOptions
+	var options runtime.CreateOptions
 	for _, o := range opts {
 		o(&options)
 	}
@@ -37,19 +30,47 @@ func (m *manager) Create(srv *gorun.Service, opts ...gorun.CreateOption) error {
 		srv.Version = "latest"
 	}
 
-	// write the object to the store
-	if err := m.createService(srv, &options); err != nil {
+	// construct the service object
+	service := &service{
+		Service:   srv,
+		Options:   &options,
+		UpdatedAt: time.Now(),
+	}
+
+	// if there is not a builder configured, start the service and then write it to the store
+	if builder.DefaultBuilder == nil {
+		// the source could be a git remote or a reference to the blob store, parse it before we run
+		// the service
+		var err error
+		srv.Source, err = m.checkoutSource(service)
+		if err != nil {
+			return err
+		}
+
+		// create the service in the underlying runtime
+		if err := m.createServiceInRuntime(service); err != nil && err != runtime.ErrAlreadyExists {
+			return err
+		}
+
+		// write the object to the store
+		return m.writeService(service)
+	}
+
+	// building ths service can take some time so we'll write the service to the store and then
+	// perform the build process async
+	service.Status = gorun.Pending
+	if err := m.writeService(service); err != nil {
 		return err
 	}
 
-	// publish the event, this will apply it aysnc to the runtime
-	return m.publishEvent(gorun.Create, srv, &options)
+	go m.buildAndRun(service)
+	return nil
 }
 
 // Read returns the service which matches the criteria provided
-func (m *manager) Read(opts ...gorun.ReadOption) ([]*gorun.Service, error) {
+func (m *manager) Read(opts ...runtime.ReadOption) ([]*runtime.Service, error) {
 	// parse the options
-	var options gorun.ReadOptions
+	var options runtime.ReadOptions
 	for _, o := range opts {
 		o(&options)
 	}
@@ -57,40 +78,65 @@ func (m *manager) Read(opts ...gorun.ReadOption) ([]*gorun.Service, error) {
 		options.Namespace = namespace.DefaultNamespace
 	}
 
-	// query the store. TODO: query by type? (it isn't an attr of srv)
-	srvs, err := m.readServices(options.Namespace, &gorun.Service{
+	// query the store
+	srvs, err := m.readServices(options.Namespace, &runtime.Service{
 		Name:    options.Service,
 		Version: options.Version,
 	})
 	if err != nil {
 		return nil, err
 	}
-	// add the metadata to the service from the local runtime (e.g. status, err)
-	statuses, err := m.listStatuses(options.Namespace)
+
+	// query the runtime and group the resulting services by name:version so they can be queried
+	rSrvs, err := m.Runtime.Read(opts...)
 	if err != nil {
 		return nil, err
 	}
-	ret := []*gorun.Service{}
-	for _, srv := range srvs {
-		ret = append(ret, srv.Service)
-		md, ok := statuses[srv.Service.Name+":"+srv.Service.Version]
+	rSrvMap := make(map[string]*runtime.Service, len(rSrvs))
+	for _, s := range rSrvs {
+		rSrvMap[s.Name+":"+s.Version] = s
+	}
+
+	// loop through the services returned from the store and append any info returned by the runtime
+	// such as status and error
+	result := make([]*runtime.Service, len(srvs))
+	for i, s := range srvs {
+		result[i] = s.Service
+
+		// check for a status on the service, this could be building, stopping etc
+		if s.Status != gorun.Unknown {
+			result[i].Status = s.Status
+		}
+		if len(s.Error) > 0 {
+			result[i].Metadata["error"] = s.Error
+		}
+
+		// set the last updated, todo: check why this is 'started' and not 'updated'. Consider adding
+		// this as an attribute on runtime.Service
+		if !s.UpdatedAt.IsZero() {
+			result[i].Metadata["started"] = s.UpdatedAt.Format(time.RFC3339)
+		}
+
+		// the service might still be building and not have been created in the underlying runtime yet
+		rs, ok := rSrvMap[s.Service.Name+":"+s.Service.Version]
 		if !ok {
 			continue
 		}
-		srv.Service.Metadata["status"] = md.Status
-		srv.Service.Metadata["error"] = md.Error
-		if !md.Updated.IsZero() {
-			srv.Service.Metadata["started"] = md.Updated.Format(time.RFC3339)
+
+		// assign the status and error. TODO: make the error an attribute on service
+		result[i].Status = rs.Status
+		if rs.Metadata != nil && len(rs.Metadata["error"]) > 0 {
+			result[i].Metadata["status"] = rs.Metadata["error"]
 		}
 	}
 
-	return ret, nil
+	return result, nil
 }
 
 // Update the service in place
-func (m *manager) Update(srv *gorun.Service, opts ...gorun.UpdateOption) error {
+func (m *manager) Update(srv *runtime.Service, opts ...runtime.UpdateOption) error {
 	// parse the options
-	var options gorun.UpdateOptions
+	var options runtime.UpdateOptions
 	for _, o := range opts {
 		o(&options)
 	}
@@ -98,47 +144,101 @@ func (m *manager) Update(srv *gorun.Service, opts ...gorun.UpdateOption) error {
 		options.Namespace = namespace.DefaultNamespace
 	}
 
-	// set defaults
+	// set default
 	if len(srv.Version) == 0 {
 		srv.Version = "latest"
 	}
 
-	// publish the update event which will trigger an update in the runtime
-	return m.publishEvent(gorun.Update, srv, &gorun.CreateOptions{Namespace: options.Namespace})
-}
-
-// Remove a service
-func (m *manager) Delete(srv *gorun.Service, opts ...gorun.DeleteOption) error {
-	// parse the options
-	var options gorun.DeleteOptions
-	for _, o := range opts {
-		o(&options)
+	// read the service from the store
+	srvs, err := m.readServices(options.Namespace, &runtime.Service{
+		Name:    srv.Name,
+		Version: srv.Version,
+	})
+	if err != nil {
+		return err
 	}
-	if len(options.Namespace) == 0 {
-		options.Namespace = namespace.DefaultNamespace
+	if len(srvs) == 0 {
+		return gorun.ErrNotFound
 	}
 
-	// set defaults
-	if len(srv.Version) == 0 {
-		srv.Version = "latest"
+	// update the service
+	service := srvs[0]
+	service.Service.Source = srv.Source
+	service.UpdatedAt = time.Now()
+
+	// if there is not a builder configured, update the service and then write it to the store
+	if builder.DefaultBuilder == nil {
+		// the source could be a git remote or a reference to the blob store, parse it before we run
+		// the service
+		var err error
+		service.Service.Source, err = m.checkoutSource(service)
+		if err != nil {
+			return err
+		}
+
+		// create the service in the underlying runtime
+		if err := m.updateServiceInRuntime(service); err != nil {
+			return err
+		}
+
+		// write the object to the store
+		service.Status = runtime.Starting
+		service.Error = ""
+		return m.writeService(service)
 	}
 
-	// delete from the store
-	if err := m.deleteService(options.Namespace, srv); err != nil {
+	// building ths service can take some time so we'll write the service to the store and then
+	// perform the build process async
+	service.Status = gorun.Pending
+	if err := m.writeService(service); err != nil {
 		return err
 	}
 
-	// publish the event which will trigger a delete in the runtime
-	return m.publishEvent(gorun.Delete, srv, &gorun.CreateOptions{Namespace: options.Namespace})
+	go m.buildAndUpdate(service)
+	return nil
 }
 
-func (m *manager) CreateNamespace(ns string) error {
-	// Do we need to store this locally?
-	return runtime.CreateNamespace(ns)
-}
+// Delete a service
+func (m *manager) Delete(srv *runtime.Service, opts ...runtime.DeleteOption) error {
+	// parse the options
+	var options runtime.DeleteOptions
+	for _, o := range opts {
+		o(&options)
+	}
+	if len(options.Namespace) == 0 {
+		options.Namespace = namespace.DefaultNamespace
+	}
 
-func (m *manager) DeleteNamespace(ns string) error {
-	return runtime.DeleteNamespace(ns)
+	// set defaults
+	if len(srv.Version) == 0 {
+		srv.Version = "latest"
+	}
+
+	// read the service from the store
+	srvs, err := m.readServices(options.Namespace, &runtime.Service{
+		Name:    srv.Name,
+		Version: srv.Version,
+	})
+	if err != nil {
+		return err
+	}
+	if len(srvs) == 0 {
+		return gorun.ErrNotFound
+	}
+
+	// delete from the underlying runtime
+	if err := m.Runtime.Delete(srv, opts...); err != nil && err != runtime.ErrNotFound {
+		return err
+	}
+
+	// delete from the store
+	if err := m.deleteService(srvs[0]); err != nil {
+		return err
+	}
+
+	// delete the source and binary from the blob store async
+	go m.cleanupBlobStore(srvs[0])
+	return nil
 }
 
 // Starts the manager
@@ -153,23 +253,10 @@ func (m *manager) Start() error {
 		return err
 	}
 
-	// watch events written to the store
-	go m.watchEvents()
-
-	// periodically load the status of services from the runtime
-	go m.watchStatus()
-
-	// todo: compare the store to the runtime incase we missed any events
-
-	// Watch services that were running previously
+	// Watch services that were running previously. TODO: rename and run periodically
 	go m.watchServices()
 
 	return nil
-}
-
-// Logs for a service
-func (m *manager) Logs(srv *gorun.Service, opts ...gorun.LogsOption) (gorun.Logs, error) {
-	return runtime.Logs(srv, opts...)
 }
 
 func (m *manager) watchServices() {
@@ -180,53 +267,37 @@ func (m *manager) watchServices() {
 	}
 
 	for _, ns := range nss {
-		srvs, err := m.readServices(ns, &gorun.Service{})
+		srvs, err := m.readServices(ns, &runtime.Service{})
 		if err != nil {
 			logger.Warnf("Error reading services from the %v namespace: %v", ns, err)
 			return
 		}
 
-		running := map[string]*gorun.Service{}
-		curr, _ := runtime.Read(gorun.ReadNamespace(ns))
+		running := map[string]*runtime.Service{}
+		curr, _ := runtime.Read(runtime.ReadNamespace(ns))
 		for _, v := range curr {
-			running[v.Name+":"+v.Version+":"+v.Source] = v
+			running[v.Name+":"+v.Version] = v
 		}
 
 		for _, srv := range srvs {
-			if _, ok := running[srv.Service.Name+":"+srv.Service.Version+":"+srv.Service.Source]; ok {
-				// already running, don't need to start again
+			// already running, don't need to start again
+			if _, ok := running[srv.Service.Name+":"+srv.Service.Version]; ok {
 				continue
 			}
 
-			// generate an auth account for the service to use
-			acc, err := m.generateAccount(srv.Service, ns)
-			if err != nil {
+			// skip services which aren't running for a reason
+			if srv.Status == gorun.Error {
 				continue
 			}
-
-			// construct the options
-			options := []gorun.CreateOption{
-				gorun.CreateImage(srv.Options.Image),
-				gorun.CreateType(srv.Options.Type),
-				gorun.CreateNamespace(ns),
-				gorun.WithArgs(srv.Options.Args...),
-				gorun.WithCommand(srv.Options.Command...),
-				gorun.WithEnv(m.runtimeEnv(srv.Service, srv.Options)),
+			if srv.Status == gorun.Building {
+				continue
 			}
-
-			// inject the credentials into the service if present
-			if len(acc.ID) > 0 && len(acc.Secret) > 0 {
-				options = append(options, gorun.WithSecret("MICRO_AUTH_ID", acc.ID))
-				options = append(options, gorun.WithSecret("MICRO_AUTH_SECRET", acc.Secret))
-			}
-
-			// add the secrets provided by the client
-			for key, value := range srv.Options.Secrets {
-				options = append(options, gorun.WithSecret(key, value))
+			if srv.Status == gorun.Stopped {
+				continue
 			}
 
 			// create the service
-			if err := runtime.Create(srv.Service, options...); err != nil {
+			if err := m.createServiceInRuntime(srv); err != nil {
 				if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
 					logger.Errorf("Error restarting service: %v", err)
 				}
@@ -253,19 +324,13 @@ func (m *manager) String() string {
 type manager struct {
 	// running is true after Start is called
 	running bool
-	// cache is a memory store which is used to store any information we don't want to write to the
-	// global store, e.g. service status / errors (these will change depending on the
-	// managed runtime and hence won't be the same globally).
-	cache store.Store
-	// fileCache is a cache store used to store any information we don't want to write to the
-	// global store but want to persist across restarts, e.g. events consumed
-	fileCache store.Store
+
+	gorun.Runtime
 }
 
 // New returns a manager for the runtime
 func New() gorun.Runtime {
 	return &manager{
-		cache:     memory.NewStore(),
-		fileCache: cachest.NewStore(filest.NewStore()),
+		Runtime: util.NewCache(runtime.DefaultRuntime),
 	}
 }
